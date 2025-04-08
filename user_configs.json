@@ -1,0 +1,50 @@
+{
+  "89783349": {
+    "strategy": {
+      "use_ema": true,
+      "use_rsi": true,
+      "use_macd": true,
+      "rsi_threshold": 40,
+      "tp_ratio": 1.05,
+      "sl_ratio": 0.97,
+      "weights": {
+        "ema": 0.4,
+        "rsi": 0.3,
+        "macd": 0.3
+      }
+    },
+    "timeframe": "15m"
+  },
+  "78964108": {
+    "strategy": {
+      "use_ema": true,
+      "use_rsi": true,
+      "use_macd": true,
+      "rsi_threshold": 40,
+      "tp_ratio": 1.05,
+      "sl_ratio": 0.97,
+      "weights": {
+        "ema": 0.4,
+        "rsi": 0.3,
+        "macd": 0.3
+      }
+    },
+    "timeframe": "5m"
+  },
+  "7515792132": {
+    "strategy": {
+      "use_ema": true,
+      "use_rsi": true,
+      "use_macd": true,
+      "rsi_threshold": 40,
+      "tp_ratio": 1.05,
+      "sl_ratio": 0.97,
+      "weights": {
+        "ema": 0.4,
+        "rsi": 0.3,
+        "macd": 0.3
+      }
+    },
+    "timeframe": "15m"
+  }
+}

@@ -1,0 +1,255 @@
+import logging
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ContextTypes
+
+from config import default_user_config, load_user_configs, save_user_configs
+from data import fetch_klines, fetch_top_symbols_by_volume
+from indicators import calculate_indicators
+from strategy import score_signal_strength, generate_signal_label
+from allocator import allocate_budget_among_signals
+from chart import plot_signal_chart
+
+user_settings = load_user_configs()
+
+
+def build_signal_message(symbol, tf, df, strat, amount=None):
+    latest = df.iloc[-1]
+    label = generate_signal_label(df, strat)
+    score = score_signal_strength(df, strat)
+
+    price = latest["close"]
+    tp = price * strat.get("tp_ratio", 1.05)
+    sl = price * strat.get("sl_ratio", 0.97)
+    rsi = latest["RSI"]
+    macd = latest["MACD"]
+    signal = latest["Signal"]
+    ema50 = latest["EMA50"]
+    ema200 = latest["EMA200"]
+
+    msg = f"{label} برای {symbol} (تایم‌فریم {tf})\n\n"
+
+    if label == "⚪️ سیگنال خنثی":
+        msg += "🤔 بازار در وضعیت بی‌تصمیمی قرار دارد و هیچ سیگنال مشخصی صادر نشده است.\n"
+        reasons = []
+        if strat["use_ema"] and abs(ema50 - ema200) / ema200 < 0.01:
+            reasons.append("- EMA50 و EMA200 بسیار نزدیک‌اند → بدون روند مشخص")
+        if strat["use_rsi"] and 40 <= rsi <= 60:
+            reasons.append(f"- RSI = {rsi:.2f} → در محدوده خنثی")
+        if strat["use_macd"] and abs(macd - signal) < 10:
+            reasons.append(f"- MACD ≈ Signal ({macd:.2f} ≈ {signal:.2f}) → بازار منتظر تصمیم است")
+
+        msg += "\n".join(reasons) if reasons else "- شرایط ورود مناسب تشخیص داده نشد."
+
+    else:
+        msg += "📌 دلایل صدور سیگنال:\n"
+        if strat["use_ema"]:
+            msg += "- EMA50 بالاتر از EMA200 → روند صعودی\n" if ema50 > ema200 else "- EMA50 پایین‌تر از EMA200 → روند نزولی\n"
+        if strat["use_rsi"]:
+            rsi_symbol = "<" if rsi < strat["rsi_threshold"] else ">"
+            msg += f"- RSI = {rsi:.2f} {rsi_symbol} آستانه {strat['rsi_threshold']}\n"
+        if strat["use_macd"]:
+            macd_relation = ">" if macd > signal else "<"
+            msg += f"- MACD ({macd:.2f}) {macd_relation} Signal ({signal:.2f})\n"
+
+        msg += f"\n🎯 قیمت ورود: {price:.2f}\n✅ هدف سود (TP): {tp:.2f}\n⛔️ حد ضرر (SL): {sl:.2f}"
+
+        if amount:
+            quantity = amount / price
+            profit = (tp - price) * quantity
+            loss = (price - sl) * quantity
+            msg += f"\n💰 مبلغ سرمایه‌گذاری: {amount:.2f} دلار\n📈 سود احتمالی: {profit:.2f} دلار\n📉 زیان احتمالی: {loss:.2f} دلار"
+
+    msg += f"\n\n📘 شرح استراتژی شما:\n"
+    msg += "در این تحلیل از اندیکاتورهای EMA، RSI و MACD استفاده شده است. EMA جهت روند را نشان می‌دهد، RSI برای تشخیص اشباع خرید/فروش، و MACD برای سنجش مومنتوم بازار استفاده می‌شود.\n"
+    msg += f"🎚 آستانه RSI = {strat['rsi_threshold']}\n"
+    msg += f"⚖️ وزن‌ها: EMA = {strat['weights']['ema']} | RSI = {strat['weights']['rsi']} | MACD = {strat['weights']['macd']}\n"
+    msg += f"⏰ زمان تحلیل: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    return msg, price, tp, sl
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if user_id not in user_settings:
+        user_settings[user_id] = default_user_config()
+        save_user_configs(user_settings)
+
+    keyboard = [
+        [InlineKeyboardButton("📈 تحلیل تک‌نماد", callback_data="analyze_single")],
+        [InlineKeyboardButton("📊 سیگنال‌دهی و بودجه‌ریزی", callback_data="group_analysis")],
+        [InlineKeyboardButton("⚙️ تنظیمات تحلیلگر", callback_data="show_settings")]
+    ]
+    await update.message.reply_text("👋 به ربات تحلیل‌گر خوش آمدید. لطفاً یک گزینه را انتخاب کنید:",
+                                    reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = str(query.from_user.id)
+
+    if query.data == "analyze_single":
+        await query.edit_message_text("🔍 لطفاً نماد رمزارز مورد نظر را وارد کنید (مثلاً BTCUSDT):")
+
+    elif query.data == "group_analysis":
+        await query.edit_message_text("💰 لطفاً بودجه دلاری خود را وارد کنید:")
+        context.user_data["expecting_budget"] = True
+
+    elif query.data == "show_settings":
+        config = user_settings.get(user_id, default_user_config())
+        strat = config["strategy"]
+        msg = f"""🛠 تنظیمات تحلیلگر شما:
+
+- EMA: {'فعال' if strat['use_ema'] else 'غیرفعال'}
+- RSI: {'فعال' if strat['use_rsi'] else 'غیرفعال'}
+- MACD: {'فعال' if strat['use_macd'] else 'غیرفعال'}
+
+🎚 آستانه RSI: {strat['rsi_threshold']}
+⚖️ وزن‌ها: EMA = {strat['weights']['ema']} | RSI = {strat['weights']['rsi']} | MACD = {strat['weights']['macd']}
+🎯 TP: {strat['tp_ratio']} | ⛔ SL: {strat['sl_ratio']}
+⏱ تایم‌فریم: {config.get("timeframe", "15m")}
+"""
+        keyboard = [
+            [InlineKeyboardButton("🎚 تغییر آستانه RSI", callback_data="edit_rsi_threshold")],
+            [InlineKeyboardButton("⚖️ تغییر وزن‌ها", callback_data="edit_weights")],
+            [InlineKeyboardButton("🎯 تغییر TP/SL", callback_data="edit_tp_sl")],
+            [InlineKeyboardButton("⏱ تغییر تایم‌فریم", callback_data="edit_timeframe")],
+        ]
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif query.data.startswith("toggle_"):
+        key = query.data.replace("toggle_", "")
+        user_settings[user_id]["strategy"][f"use_{key}"] ^= True
+        save_user_configs(user_settings)
+        await button_handler(update, context)
+
+    elif query.data.startswith("tf_"):
+        tf = query.data.replace("tf_", "")
+        user_settings[user_id]["timeframe"] = tf
+        save_user_configs(user_settings)
+        await query.edit_message_text(f"⏱ تایم‌فریم به {tf} تنظیم شد.")
+
+    elif query.data == "edit_rsi_threshold":
+        context.user_data["expecting_rsi_threshold"] = True
+        await query.edit_message_text("🎚 لطفاً مقدار جدید RSI را وارد کنید (مثلاً 40):")
+
+    elif query.data == "edit_weights":
+        context.user_data["expecting_weights"] = True
+        await query.edit_message_text("⚖️ لطفاً وزن‌ها را وارد کنید. مثل: 0.4 0.3 0.3")
+
+    elif query.data == "edit_tp_sl":
+        context.user_data["expecting_tp_sl"] = True
+        await query.edit_message_text("🎯 لطفاً نسبت TP/SL را وارد کنید (مثلاً: 1.05 0.97)")
+
+    elif query.data == "edit_timeframe":
+        timeframes = ["1m", "5m", "15m", "1h", "4h", "1d"]
+        keyboard = [[InlineKeyboardButton(tf, callback_data=f"tf_{tf}") for tf in timeframes[i:i + 3]] for i in range(0, 6, 3)]
+        await query.edit_message_text("⏱ لطفاً تایم‌فریم مورد نظر را انتخاب کنید:",
+                                      reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    user_id = str(update.effective_user.id)
+
+    if context.user_data.get("expecting_budget"):
+        try:
+            budget = float(text)
+            context.user_data["expecting_budget"] = False
+            await update.message.reply_text("⌛ در حال تحلیل بازار...")
+            await group_analysis_and_allocation(update, context, user_id, budget)
+        except ValueError:
+            await update.message.reply_text("❌ لطفاً یک عدد معتبر وارد کنید.")
+        return
+
+    if context.user_data.get("expecting_rsi_threshold"):
+        try:
+            rsi_val = float(text)
+            user_settings[user_id]["strategy"]["rsi_threshold"] = rsi_val
+            save_user_configs(user_settings)
+            context.user_data["expecting_rsi_threshold"] = False
+            await update.message.reply_text(f"🎚 آستانه RSI به {rsi_val} تغییر یافت.")
+        except:
+            await update.message.reply_text("❌ عدد وارد شده معتبر نیست.")
+        return
+
+    if context.user_data.get("expecting_weights"):
+        try:
+            parts = list(map(float, text.split()))
+            if len(parts) != 3 or abs(sum(parts) - 1.0) > 0.01:
+                raise ValueError("⚖️ وزن‌ها باید شامل ۳ عدد باشند که مجموعشان ۱ شود.")
+            user_settings[user_id]["strategy"]["weights"] = dict(zip(["ema", "rsi", "macd"], parts))
+            save_user_configs(user_settings)
+            context.user_data["expecting_weights"] = False
+            await update.message.reply_text("✅ وزن‌ها با موفقیت ذخیره شدند.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطا: {str(e)}")
+        return
+
+    if context.user_data.get("expecting_tp_sl"):
+        try:
+            tp, sl = map(float, text.split())
+            user_settings[user_id]["strategy"]["tp_ratio"] = tp
+            user_settings[user_id]["strategy"]["sl_ratio"] = sl
+            save_user_configs(user_settings)
+            context.user_data["expecting_tp_sl"] = False
+            await update.message.reply_text("🎯 نسبت TP / SL با موفقیت ذخیره شد.")
+        except:
+            await update.message.reply_text("❌ لطفاً دو عدد مثل '1.05 0.97' وارد کنید.")
+        return
+
+    # تحلیل تک نماد
+    symbol = text.upper()
+    tf = user_settings.get(user_id, default_user_config()).get("timeframe", "15m")
+    df = await fetch_klines(symbol, tf)
+    if df is None or df.empty:
+        await update.message.reply_text("❌ نماد نامعتبر یا اطلاعاتی در دسترس نیست.")
+        return
+
+    df = calculate_indicators(df)
+    strat = user_settings[user_id]["strategy"]
+    msg, *_ = build_signal_message(symbol, tf, df, strat)
+    await update.message.reply_text(msg)
+
+
+
+async def group_analysis_and_allocation(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str, budget: float):
+    tf = user_settings[user_id].get("timeframe", "15m")
+    strat = user_settings[user_id]["strategy"]
+
+    top_symbols = await fetch_top_symbols_by_volume()
+    results = []
+
+    for symbol in top_symbols:
+        df = await fetch_klines(symbol, tf)
+        if df is None or df.empty:
+            continue
+        df = calculate_indicators(df)
+        score = score_signal_strength(df, strat)
+        results.append((symbol, score, df))
+
+    results = sorted(results, key=lambda x: x[1], reverse=True)[:4]
+    allocation = allocate_budget_among_signals(results, budget)
+
+    await update.message.reply_text(f"📊 سیگنال‌دهی و بودجه‌ریزی برای تایم‌فریم {tf} و بودجه ${budget:.2f}:")
+
+    total_profit, total_loss = 0, 0
+
+    for symbol, score, df in results:
+        amount = allocation[symbol]["amount"]
+        msg, price, tp, sl = build_signal_message(symbol, tf, df, strat, amount)
+        await update.message.reply_text(msg)
+
+        chart_path = f"{symbol}_chart.png"
+        plot_signal_chart(df, symbol, price, tp, sl, chart_path)
+        await update.message.reply_photo(photo=open(chart_path, "rb"))
+
+        quantity = amount / price
+        total_profit += (tp - price) * quantity
+        total_loss += (price - sl) * quantity
+
+    await update.message.reply_text(f"💼 سود کل احتمالی: ${total_profit:.2f}\n💣 زیان کل احتمالی: ${total_loss:.2f}")
+
+
+
+
