@@ -4,7 +4,7 @@ from bot import start, button_handler, handle_text
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 
 async def main():
-    application = Application.builder().token("8029342172:AAHeOFxkGM4kmEBDzrqdZ-SQJ988QeAQhxE").build()
+    application = Application.builder().token("8029342172:AAEdx4O9KAYvjEJUXLeKzim5MotqMZURMOs").build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
