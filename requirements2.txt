@@ -1,5 +1,0 @@
-python-telegram-bot==20.0
-aiohttp==3.8.5
-pandas==1.5.3
-numpy==1.21.0  # نسخه سازگار با pandas 1.5.3
-python-dotenv
